@@ -1897,16 +1897,24 @@ local MODES = {"Easy", "Normal", "Hard", "Insane"}
 local SPEEDS = {1, 1.5, 2}
 local TARGETS = {"First", "Last", "Closest", "Strong", "Weak"}
 local MAX_UNITS = 15 -- unit cap of the game (Units: x/15)
+-- per-unit placement limits (lower-case names); only Rapid Macro uses them. Add more here if you find any.
+local UNIT_LIMITS = {
+    ["scientist cameraman"] = 4,
+    ["titan cameraman"] = 8,
+}
 
 local cfg = {
     autoSkip = false,
     autoVote = false,
     autoSpeed = false,
     autoPlayAgain = false,
+    autoLeave = false,      -- Auto Leave Lobby (OnLeave from the result screen)
+    rapidMacro = false,     -- Rapid Macro: enhanced replay engine (off = normal replay)
     mode = "Insane",
     speed = 2,
     skipDelay = 2,          -- internal
     playAgainDelay = 0.25,  -- internal (the result screen is answered almost at once)
+    leaveDelay = 0.5,       -- internal
 }
 
 local st = {
@@ -1924,6 +1932,7 @@ local mc = {
     id2pos = {}, id2mode = {},
     waitPlace = nil, waitPlaceOk = false, placeFail = nil, upFail = false, upAck = {},
     initDone = false, finalSeen = false,
+    id2name = {}, limits = {}, learned = false,
 }
 -- ctx is what the (install-once) hook reads, so re-runs never stack hooks
 local ctx = {mc = mc, R = R, mv = nil}
@@ -1934,6 +1943,7 @@ local sanitize = UI.Sanitize
 
 local Win
 local recToggle, playToggle, replayDD, macroDD, nameInput, macroStatus
+local tgPlayAgain, tgLeave, rapidToggle
 
 local function flash(t, kind)
     UI:Notify({Title = "Diamond Hub", Content = t, Duration = 2.5, Type = kind or "Info"})
@@ -1954,6 +1964,20 @@ local function setSpeed(s)
     task.spawn(function()
         pcall(function() R.ChangeSpeed:InvokeServer(s) end)
     end)
+end
+
+-- Auto Leave Lobby: OnLeave may be an event or a function, the game's own button fires it with no arguments
+local function fireLeave()
+    local r = R.OnLeave
+    if not r then
+        flash("Auto Leave Lobby: OnLeave remote not found", "Error")
+        return
+    end
+    if r:IsA("RemoteFunction") then
+        task.spawn(function() pcall(function() r:InvokeServer() end) end)
+    else
+        r:FireServer()
+    end
 end
 
 local function visible(o)
@@ -2072,7 +2096,7 @@ end
 local function newMatch()
     mc.matchId = mc.matchId + 1
     mc.wave = 0
-    mc.id2pos, mc.id2mode, mc.upAck = {}, {}, {}
+    mc.id2pos, mc.id2mode, mc.upAck, mc.id2name = {}, {}, {}, {}
     mc.pend, mc.queue = {}, {}
     mc.finalSeen = false
     st.curSpeed, st.waveOn = nil, false
@@ -2101,10 +2125,12 @@ local function onTowerAdd(t)
         if id ~= t.Id and (p - pos).Magnitude < 0.5 then
             mc.id2pos[id] = nil
             mc.id2mode[id] = nil
+            mc.id2name[id] = nil
         end
     end
     mc.id2pos[t.Id] = pos
     mc.id2mode[t.Id] = t.TargetMode
+    mc.id2name[t.Id] = t.Name
 
     if mc.waitPlace and (pos - mc.waitPlace).Magnitude < 1 then
         mc.waitPlaceOk = true
@@ -2148,6 +2174,7 @@ local function onTowerRemove(t)
     end
     mc.id2pos[t.Id] = nil
     mc.id2mode[t.Id] = nil
+    mc.id2name[t.Id] = nil
 end
 
 local function onTowerTarget(t)
@@ -2185,7 +2212,11 @@ local function onNotify(msg)
             mc.placeFail = "money"
         elseif not low:find("successfully placed", 1, true) and (low:find("place", 1, true)
             or low:find("limit", 1, true) or low:find("can't", 1, true) or low:find("cannot", 1, true)) then
-            mc.placeFail = "other"
+            if low:find("limit", 1, true) or low:find("maximum", 1, true) or low:find("only place", 1, true) then
+                mc.placeFail = "limit"
+            else
+                mc.placeFail = "other"
+            end
         end
     end
     if msg:find("enough money to upgrade") then
@@ -2345,6 +2376,152 @@ local function doUpgrade(s, myMatch)
     return false
 end
 
+-- ===== Rapid Macro: the enhanced replay engine (Macro tab > Rapid Macro; off = the normal functions above) =====
+-- what it adds: an upgrade counts only when the price really left our money (a late "not enough money" notice
+-- can no longer slip through), prices are learned and saved into the macro, steps wait for the exact price
+-- instead of hammering the server, per-unit placement limits are respected.
+local function limitFor(name)
+    if type(name) ~= "string" then return nil end
+    return UNIT_LIMITS[name:lower()] or mc.limits[name]
+end
+
+local function countName(name)
+    local n = 0
+    for _, nm in pairs(mc.id2name) do
+        if nm == name then n = n + 1 end
+    end
+    return n
+end
+
+-- how long to wait for the server's answer to an upgrade: long enough that a late notice is not taken for silence
+local function upgradeWait()
+    local ok, ping = pcall(function() return lp:GetNetworkPing() end)
+    if not ok or type(ping) ~= "number" then ping = 0.1 end
+    return math.clamp(ping * 4 + 0.5, 0.8, 1.6)
+end
+
+-- after "not enough money": wait for `extra` more money (and at least 0.5 s) before the next attempt
+local function waitIncome(myMatch, extra)
+    local mf, t0 = money(), os.clock()
+    return waitUntil(function()
+        return money() >= mf + (extra or 1) and os.clock() - t0 >= 0.5
+    end, math.huge, myMatch, 0.1)
+end
+
+-- keep a measured price on the step (saved into the macro file after the run)
+local function keepPrice(s, c)
+    if c > 0 and (not s.c or math.abs(s.c - c) > math.max(10, c * 0.1)) then
+        s.c = c
+        mc.learned = true
+    end
+end
+
+local function doPlaceRapid(s, myMatch)
+    local p = a2v(s.p)
+    if idAt(p) then return true end -- already standing there
+    if ownCount() >= MAX_UNITS then
+        flash("Unit limit reached (" .. MAX_UNITS .. "), step skipped", "Warning")
+        return false
+    end
+    local lim = limitFor(s.n)
+    if lim and countName(s.n) >= lim then
+        flash(tostring(s.n) .. " limit (" .. lim .. ") reached, step skipped", "Warning")
+        return false
+    end
+    local unitId = resolveUnit(s.n, s.u)
+    local misses, backoff = 0, 5
+    while same(myMatch) do
+        if idAt(p) then return true end -- a late answer: it is standing there now
+        -- known price: wait until it is affordable (capped, the server has the last word)
+        if s.c and money() < s.c then
+            waitUntil(function() return money() >= s.c end, 45, myMatch, 0.1)
+            if not same(myMatch) then return false end
+        end
+        local m0 = money()
+        mc.waitPlace, mc.waitPlaceOk, mc.placeFail = p, false, nil
+        R.TowerAdd:FireServer({Pos = p, CFrame = CFrame.new(p), Name = s.n, UnitId = unitId})
+        waitUntil(function() return mc.waitPlaceOk or mc.placeFail ~= nil end, 1.5, myMatch, 0.02)
+        local ok, fail = mc.waitPlaceOk, mc.placeFail
+        mc.waitPlace = nil
+        if ok then
+            -- let the price show up: it is measured, and the next step starts from settled money
+            local lo = m0
+            waitUntil(function()
+                local mn = money()
+                if mn < lo then lo = mn end
+                return lo < m0
+            end, 0.5, myMatch, 0.02)
+            keepPrice(s, m0 - lo)
+            return true
+        end
+        if not same(myMatch) then return false end
+        if fail == "limit" then
+            local n = countName(s.n)
+            if n > 0 then mc.limits[s.n] = n end
+            flash(tostring(s.n) .. " limit reached, step skipped", "Warning")
+            return false
+        elseif fail == "money" then
+            if not waitIncome(myMatch, backoff) then return false end
+            backoff = math.min(backoff * 2, 300)
+        else
+            misses = misses + 1
+            if misses >= 6 then
+                flash("Place failed, step skipped", "Warning")
+                return false
+            end
+            if not sleep(0.6, myMatch) then return false end
+        end
+    end
+    return false
+end
+
+local function doUpgradeRapid(s, myMatch)
+    local p = a2v(s.p)
+    local backoff = 5
+    while same(myMatch) do
+        local id = idAt(p)
+        if not id then return false end -- nothing standing there (earlier place failed)
+        -- known price: wait until it is affordable instead of hammering the server
+        if s.c and money() < s.c then
+            waitUntil(function() return money() >= s.c end, 45, myMatch, 0.1)
+            if not same(myMatch) then return false end
+        end
+        mc.upFail = false
+        local before = mc.upAck[id]
+        local m0 = money()
+        local lo = m0
+        R.TowerUpgrade:FireServer({Id = id})
+        -- success = the price leaves our money (or the server confirms), failure = the "not enough money" notice.
+        -- Silence for the whole window means something else (max level): the step is simply done.
+        local outcome = "silent"
+        local t0, window = os.clock(), upgradeWait()
+        while same(myMatch) and os.clock() - t0 < window do
+            if mc.upFail then
+                outcome = "fail"
+                break
+            end
+            local mn = money()
+            if mn < lo then lo = mn end
+            if lo < m0 or mc.upAck[id] ~= before then
+                outcome = "ok"
+                break
+            end
+            task.wait(0.02)
+        end
+        if not same(myMatch) then return false end
+        if outcome == "ok" then
+            keepPrice(s, m0 - lo)
+            return true
+        elseif outcome == "silent" then
+            return true
+        end
+        -- not enough money: wait for income (the wait grows, so an unknown price costs few attempts)
+        if not waitIncome(myMatch, backoff) then return false end
+        backoff = math.min(backoff * 2, 300)
+    end
+    return false
+end
+
 local function doSell(s, myMatch)
     local id = idAt(a2v(s.p))
     if not id then return false end
@@ -2380,14 +2557,16 @@ end
 local function runPlayback(myMatch)
     mc.playing = true
     mc.stepNo = 0
+    local sel, steps = mc.selected, mc.steps
     for i, s in ipairs(mc.steps) do
         if not same(myMatch) then break end
         mc.stepNo = i
         if gate(s, myMatch) then
+            local rapid = cfg.rapidMacro
             if s.t == "place" then
-                doPlace(s, myMatch)
+                if rapid then doPlaceRapid(s, myMatch) else doPlace(s, myMatch) end
             elseif s.t == "upgrade" then
-                doUpgrade(s, myMatch)
+                if rapid then doUpgradeRapid(s, myMatch) else doUpgrade(s, myMatch) end
             elseif s.t == "sell" then
                 doSell(s, myMatch)
             elseif s.t == "target" then
@@ -2398,6 +2577,13 @@ local function runPlayback(myMatch)
     end
     local finished = same(myMatch) and mc.stepNo >= #mc.steps
     mc.playing = false
+    -- prices measured during a Rapid run are written back: the next matches wait for the exact amount
+    if mc.learned and sel and sel == mc.selected and steps == mc.steps then
+        mc.learned = false
+        if MAC.write(sel, {v = 2, replay = mc.replay, steps = mc.steps}) then
+            flash("Macro calibrated: prices saved", "Success")
+        end
+    end
     if finished then flash("Macro finished, waiting for the next match", "Success") end
 end
 
@@ -2508,9 +2694,27 @@ autoGrid:AddToggle({
         if v and st.curSpeed ~= cfg.speed then setSpeed(cfg.speed) end
     end,
 })
-autoGrid:AddToggle({
+tgPlayAgain = autoGrid:AddToggle({
     Name = "Auto Play Again", Flag = "autoPlayAgain", Tooltip = "Presses Play Again on the result screen",
-    Callback = function(v) cfg.autoPlayAgain = v end,
+    Callback = function(v)
+        cfg.autoPlayAgain = v
+        if v and cfg.autoLeave then
+            cfg.autoLeave = false
+            if tgLeave then tgLeave:Set(false, true) end
+            flash("Auto Leave Lobby turned off: Play Again is on")
+        end
+    end,
+})
+tgLeave = autoGrid:AddToggle({
+    Name = "Auto Leave Lobby", Flag = "autoLeave", Tooltip = "Leaves to the lobby from the result screen (instead of Play Again)",
+    Callback = function(v)
+        cfg.autoLeave = v
+        if v and cfg.autoPlayAgain then
+            cfg.autoPlayAgain = false
+            if tgPlayAgain then tgPlayAgain:Set(false, true) end
+            flash("Auto Play Again turned off: Leave Lobby is on")
+        end
+    end,
 })
 
 local optSec = mainTab:AddSection("Game Options")
@@ -2604,6 +2808,14 @@ replayDD = recSec:AddDropdown({
         end
     end,
 })
+rapidToggle = recSec:AddToggle({
+    Name = "Rapid Macro", Flag = "rapidMacro",
+    Tooltip = "Enhanced replay: verified upgrades, learned prices (saved into the macro), unit limits. Off = normal replay",
+    Callback = function(v)
+        cfg.rapidMacro = v
+        flash(v and "Rapid Macro on: enhanced replay" or "Rapid Macro off: normal replay")
+    end,
+})
 macroStatus = recSec:AddLabel({Text = "idle"})
 recSec:AddButton({
     Name = "Clear Steps", Style = "Danger",
@@ -2671,6 +2883,7 @@ local function init()
         end
     end
     R.ChangeSpeed = fn:WaitForChild("ChangeSpeed", 10) -- optional, only Auto Speed needs it
+    R.OnLeave = ev:FindFirstChild("OnLeave") or fn:FindFirstChild("OnLeave") -- optional, only Auto Leave Lobby needs it
     R.Notificate.OnClientEvent:Connect(onNotify)
 
     -- macro remotes: if any is missing only the macro is disabled
@@ -2754,10 +2967,15 @@ local function init()
                 st.inVote = false
                 if finalOpen() then
                     matchEnded()
-                    if cfg.autoPlayAgain and not st.finalShown then
+                    if (cfg.autoLeave or cfg.autoPlayAgain) and not st.finalShown then
                         st.finalShown = true
-                        task.delay(cfg.playAgainDelay, function()
-                            if alive() and cfg.autoPlayAgain then R.PlayAgain:FireServer() end
+                        task.delay(cfg.autoLeave and cfg.leaveDelay or cfg.playAgainDelay, function()
+                            if not alive() then return end
+                            if cfg.autoLeave then
+                                fireLeave()
+                            elseif cfg.autoPlayAgain then
+                                R.PlayAgain:FireServer()
+                            end
                         end)
                     end
                 else
