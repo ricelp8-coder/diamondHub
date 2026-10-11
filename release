@@ -137,7 +137,7 @@ local DiamondUI = (function()
     end
 
     local function sanitize(s)
-        s = tostring(s or ""):gsub("[^%w _%-]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+        s = tostring(s or ""):gsub("[^%w _%-#]", ""):gsub("^%s+", ""):gsub("%s+$", "")
         return s:sub(1, 24)
     end
     Lib.Sanitize = sanitize
@@ -1912,13 +1912,14 @@ local cfg = {
     rapidMacro = false,     -- Rapid Macro: enhanced replay engine (off = normal replay)
     mode = "Insane",
     speed = 2,
-    skipDelay = 2,          -- internal
+    skipDelay = 0.1,        -- internal (the first skip comes right after the wave starts)
+    skipRepeat = 1.0,       -- internal (retry while the wave goes on)
     playAgainDelay = 0.25,  -- internal (the result screen is answered almost at once)
     leaveDelay = 0.5,       -- internal
 }
 
 local st = {
-    waveOn = false, lastSkipT = 0, curSpeed = nil,
+    waveOn = false, nextSkip = 0, curSpeed = nil,
     inVote = false, voted = false, finalShown = false,
 }
 
@@ -1943,7 +1944,7 @@ local sanitize = UI.Sanitize
 
 local Win
 local recToggle, playToggle, replayDD, macroDD, nameInput, macroStatus
-local tgPlayAgain, tgLeave, rapidToggle
+local tgPlayAgain, tgLeave, rapidToggle, finishRecording
 
 local function flash(t, kind)
     UI:Notify({Title = "Diamond Hub", Content = t, Duration = 2.5, Type = kind or "Info"})
@@ -2094,13 +2095,15 @@ end
 
 -- new match: abort a running macro, reset wave, speed and the tower cache
 local function newMatch()
+    -- a recording that is still running is saved before everything is reset
+    if mc.rec and finishRecording then finishRecording("New match") end
     mc.matchId = mc.matchId + 1
     mc.wave = 0
     mc.id2pos, mc.id2mode, mc.upAck, mc.id2name = {}, {}, {}, {}
     mc.pend, mc.queue = {}, {}
     mc.finalSeen = false
     st.curSpeed, st.waveOn = nil, false
-    if mc.rec then
+    if mc.rec then -- fallback: auto-save was not available
         mc.rec = false
         syncToggles()
         flash("Recording stopped: new match")
@@ -2111,6 +2114,8 @@ end
 local function matchEnded()
     if mc.finalSeen then return end
     mc.finalSeen = true
+    -- the round is over: a recording is saved right away (macro #1, #2, ... unless a name is typed)
+    if mc.rec and finishRecording then finishRecording("Round ended") end
     mc.matchId = mc.matchId + 1
     mc.ranMatch = mc.matchId
 end
@@ -2228,7 +2233,7 @@ local function onNotify(msg)
         local n = msg:match("Wave (%d+) started")
         if n == "1" and mc.finalSeen then newMatch() end
         st.waveOn = true
-        st.lastSkipT = os.clock()
+        st.nextSkip = os.clock() + cfg.skipDelay
         if n then mc.wave = tonumber(n) end
         if cfg.autoSpeed and st.curSpeed ~= cfg.speed then
             task.delay(1, function()
@@ -2298,13 +2303,6 @@ local function waitUntil(cond, timeout, myMatch, step)
     return false
 end
 
--- how long to wait for the server's answer to an upgrade (adapts to the connection)
-local function upgradeCheck()
-    local ok, ping = pcall(function() return lp:GetNetworkPing() end)
-    if not ok or type(ping) ~= "number" then ping = 0.1 end
-    return math.clamp(ping * 2 + 0.06, 0.12, 0.5)
-end
-
 -- after a "not enough money" answer: wait until some income arrived, then the step is retried
 local function waitMoreMoney(myMatch)
     local mf, t0 = money(), os.clock()
@@ -2322,64 +2320,7 @@ local function resolveUnit(name, saved)
     return saved
 end
 
-local function doPlace(s, myMatch)
-    local p = a2v(s.p)
-    if idAt(p) then return true end -- already standing there
-    if ownCount() >= MAX_UNITS then
-        flash("Unit limit reached (" .. MAX_UNITS .. "), step skipped", "Warning")
-        return false
-    end
-    local unitId = resolveUnit(s.n, s.u)
-    local misses = 0
-    while same(myMatch) do
-        -- known cost: do not fire before it is affordable (capped, the server has the last word)
-        if s.c and money() < s.c then
-            waitUntil(function() return money() >= s.c end, 20, myMatch, 0.1)
-            if not same(myMatch) then return false end
-        end
-        mc.waitPlace, mc.waitPlaceOk, mc.placeFail = p, false, nil
-        R.TowerAdd:FireServer({Pos = p, CFrame = CFrame.new(p), Name = s.n, UnitId = unitId})
-        waitUntil(function() return mc.waitPlaceOk or mc.placeFail ~= nil end, 1.2, myMatch, 0.02)
-        local ok, fail = mc.waitPlaceOk, mc.placeFail
-        mc.waitPlace = nil
-        if ok then return true end
-        if not same(myMatch) then return false end
-        if fail == "money" then
-            if not waitMoreMoney(myMatch) then return false end
-        else
-            misses = misses + 1
-            if misses >= 6 then
-                flash("Place failed, step skipped", "Warning")
-                return false
-            end
-            if not sleep(0.6, myMatch) then return false end
-        end
-    end
-    return false
-end
-
--- upgrades are fired back to back like fast taps: wait only for the server's answer, not a fixed time
-local function doUpgrade(s, myMatch)
-    local p = a2v(s.p)
-    while same(myMatch) do
-        local id = idAt(p)
-        if not id then return false end -- nothing standing there (earlier place failed)
-        mc.upFail = false
-        local before = mc.upAck[id]
-        R.TowerUpgrade:FireServer({Id = id})
-        -- answer: S->C TowerUpgrade for this tower, a "not enough money" notice, or silence (= accepted)
-        waitUntil(function() return mc.upFail or mc.upAck[id] ~= before end, upgradeCheck(), myMatch, 0.02)
-        if not same(myMatch) then return false end
-        if not mc.upFail then return true end
-        if not waitMoreMoney(myMatch) then return false end
-    end
-    return false
-end
-
--- ===== Rapid Macro: the enhanced replay engine (Macro tab > Rapid Macro; off = the normal functions above) =====
--- what it adds: an upgrade counts only when the price really left our money (a late "not enough money" notice
--- can no longer slip through), prices are learned and saved into the macro, steps wait for the exact price
--- instead of hammering the server, per-unit placement limits are respected.
+-- per-unit placement limits (UNIT_LIMITS plus limits learned from the server's answers)
 local function limitFor(name)
     if type(name) ~= "string" then return nil end
     return UNIT_LIMITS[name:lower()] or mc.limits[name]
@@ -2393,6 +2334,67 @@ local function countName(name)
     return n
 end
 
+-- ===== Normal replay: the original engine (recorded-money gate, fixed waits) plus the safety checks =====
+local function doPlace(s, myMatch)
+    local p = a2v(s.p)
+    if idAt(p) then return true end -- already standing there
+    if ownCount() >= MAX_UNITS then
+        flash("Unit limit reached (" .. MAX_UNITS .. "), step skipped", "Warning")
+        return false
+    end
+    local lim = limitFor(s.n)
+    if lim and countName(s.n) >= lim then
+        flash(tostring(s.n) .. " limit (" .. lim .. ") reached, step skipped", "Warning")
+        return false
+    end
+    local unitId = resolveUnit(s.n, s.u)
+    local misses = 0
+    while misses < 6 do
+        if not same(myMatch) then return false end
+        if idAt(p) then return true end -- a late answer: it is standing there now
+        mc.waitPlace, mc.waitPlaceOk, mc.placeFail = p, false, nil
+        R.TowerAdd:FireServer({Pos = p, CFrame = CFrame.new(p), Name = s.n, UnitId = unitId})
+        waitUntil(function() return mc.waitPlaceOk or mc.placeFail ~= nil end, 2.5, myMatch)
+        local ok, fail = mc.waitPlaceOk, mc.placeFail
+        mc.waitPlace = nil
+        if ok then return true end
+        if not same(myMatch) then return false end
+        if fail == "limit" then
+            local n = countName(s.n)
+            if n > 0 then mc.limits[s.n] = n end
+            flash(tostring(s.n) .. " limit reached, step skipped", "Warning")
+            return false
+        elseif fail == "money" then
+            -- not enough money is no failed attempt: wait for income, then try again
+            if not waitMoreMoney(myMatch) then return false end
+        else
+            misses = misses + 1
+            if not sleep(1.5, myMatch) then return false end
+        end
+    end
+    flash("Place failed, step skipped", "Warning")
+    return false
+end
+
+local function doUpgrade(s, myMatch)
+    local p = a2v(s.p)
+    while same(myMatch) do
+        local id = idAt(p)
+        if not id then return false end -- nothing standing there (earlier place failed)
+        mc.upFail = false
+        R.TowerUpgrade:FireServer({Id = id})
+        if not sleep(0.7, myMatch) then return false end
+        if not mc.upFail then return true end
+        -- not enough money: wait for income and try again, the step is not given up
+        if not waitMoreMoney(myMatch) then return false end
+    end
+    return false
+end
+
+-- ===== Rapid Macro: the enhanced replay engine (Macro tab > Rapid Macro; off = the normal functions above) =====
+-- what it adds: an upgrade counts only when the price really left our money (a late "not enough money" notice
+-- can no longer slip through), prices are learned and saved into the macro, steps wait for the exact price
+-- instead of hammering the server, per-unit placement limits are respected.
 -- how long to wait for the server's answer to an upgrade: long enough that a late notice is not taken for silence
 local function upgradeWait()
     local ok, ping = pcall(function() return lp:GetNetworkPing() end)
@@ -2545,6 +2547,19 @@ local function doTarget(s, myMatch)
     return false
 end
 
+-- Normal replay gate (the original): sells/target changes wait for their wave, Wave mode makes everything wait
+-- for it, place/upgrade also wait for the recorded amount of money
+local function gateNormal(s, myMatch)
+    if mc.replay == "Wave" or s.t == "sell" or s.t == "target" then
+        if not waitUntil(function() return mc.wave >= (s.w or 0) end, math.huge, myMatch) then return false end
+    end
+    if s.t == "place" or s.t == "upgrade" then
+        if not waitUntil(function() return money() >= (s.m or 0) end, math.huge, myMatch) then return false end
+    end
+    return true
+end
+
+-- Rapid gate
 local function gate(s, myMatch)
     -- sells/target changes always wait for their wave, Wave mode makes everything wait for it.
     -- In Money mode place/upgrade run as soon as the previous step is done and retry until affordable.
@@ -2561,8 +2576,10 @@ local function runPlayback(myMatch)
     for i, s in ipairs(mc.steps) do
         if not same(myMatch) then break end
         mc.stepNo = i
-        if gate(s, myMatch) then
-            local rapid = cfg.rapidMacro
+        local rapid = cfg.rapidMacro
+        local passed
+        if rapid then passed = gate(s, myMatch) else passed = gateNormal(s, myMatch) end
+        if passed then
             if s.t == "place" then
                 if rapid then doPlaceRapid(s, myMatch) else doPlace(s, myMatch) end
             elseif s.t == "upgrade" then
@@ -2572,7 +2589,7 @@ local function runPlayback(myMatch)
             elseif s.t == "target" then
                 doTarget(s, myMatch)
             end
-            task.wait(0.02)
+            if rapid then task.wait(0.02) else sleep(0.15, myMatch) end
         end
     end
     local finished = same(myMatch) and mc.stepNo >= #mc.steps
@@ -2665,6 +2682,44 @@ local function deleteMacro()
     end
 end
 
+-- default name for a recording nobody named: macro #1, macro #2, ...
+local function nextMacroName()
+    local n = 1
+    while MAC.exists("macro #" .. n) do n = n + 1 end
+    return "macro #" .. n
+end
+
+-- stops a running recording and saves it (called when the round ends)
+finishRecording = function(why)
+    if not mc.rec then return end
+    pcall(drainQueue)
+    for i = #mc.pend, 1, -1 do -- upgrades still waiting for their 1.2 s check are accepted now
+        local e = mc.pend[i]
+        if e.k == "upgrade" then
+            pushStep({t = "upgrade", p = v2a(e.p), m = e.m, w = e.w, ts = e.ts})
+        end
+    end
+    mc.pend, mc.queue = {}, {}
+    mc.rec = false
+    syncToggles()
+    if #mc.steps == 0 then
+        flash(why .. ": nothing was recorded", "Warning")
+        return
+    end
+    local name = sanitize(nameInput and nameInput:Get() or "")
+    if name == "" then name = nextMacroName() end
+    if MAC.write(name, {v = 2, replay = mc.replay, steps = mc.steps}) then
+        mc.selected = name
+        MAC.setAuto(name)
+        refreshMacroList()
+        if macroDD then macroDD:Set(name, true) end
+        if nameInput then nameInput:Set(name, true) end
+        flash(why .. ": macro saved as " .. name .. " (" .. #mc.steps .. " steps)", "Success")
+    else
+        flash("Auto-save failed", "Error")
+    end
+end
+
 -- ===== window =====
 Win = UI:CreateWindow({
     Title = "Diamond Hub v1", Subtitle = "Cameraman TD", Theme = "Dark",
@@ -2739,7 +2794,7 @@ local recSec = macroTab:AddSection("Recorder")
 local recGrid = recSec:AddGrid({Columns = 2, CellHeight = 34})
 recToggle = recGrid:AddToggle({
     Name = "Record", NoSave = true,
-    Tooltip = "Records the units you place, upgrade, sell and retarget by hand",
+    Tooltip = "Records the units you place, upgrade, sell and retarget by hand. Saved by itself when the round ends (macro #1, #2, ... or the typed name)",
     Callback = function(v)
         if v then
             if not mc.ok then
@@ -2759,9 +2814,12 @@ recToggle = recGrid:AddToggle({
             end
             mc.rec = true
             mc.steps, mc.pend, mc.queue = {}, {}, {}
+            -- the name of a loaded macro stays out of the way: a new recording gets its own name
+            local prev = mc.selected
             mc.selected = nil
             if macroDD then macroDD:Set(nil, true) end
-            flash("Recording: place, upgrade, sell and retarget as usual")
+            if prev and nameInput and sanitize(nameInput:Get()) == prev then nameInput:Set("", true) end
+            flash("Recording: it is saved by itself when the round ends")
         else
             mc.rec = false
             flash("Recording stopped: " .. #mc.steps .. " steps")
@@ -2909,13 +2967,13 @@ local function init()
         syncToggles()
     end
 
-    -- auto skip: first call skipDelay sec after wave start, then every ~2.5 sec until "Wave Cleared"
+    -- auto skip: first call right after the wave starts, then a retry every skipRepeat sec until "Wave Cleared"
     task.spawn(function()
         while alive() do
-            task.wait(0.5)
-            if cfg.autoSkip and st.waveOn and os.clock() - st.lastSkipT >= cfg.skipDelay then
+            task.wait(0.1)
+            if cfg.autoSkip and st.waveOn and os.clock() >= st.nextSkip then
                 R.WaveSkip:FireServer()
-                st.lastSkipT = os.clock() + 0.5
+                st.nextSkip = os.clock() + cfg.skipRepeat
             end
         end
     end)
