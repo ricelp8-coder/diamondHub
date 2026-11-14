@@ -1,5 +1,7 @@
 local Releases = {
     [10762636904] = {Release = "Cameraman_TD", Folder = "CameraTD_Macros", RequiresCache = true},
+    -- Doors: the whole universe (lobby, game, Fools, Party), the hub itself skips the lobby.
+    [2440500124] = {Release = "Doors", Folder = "DiamondHub_Doors", RequiresCache = false},
 }
 local BaseURL = "https://raw.githubusercontent.com/ricelp8-coder/koch/main/"
 if not game:IsLoaded() then game.Loaded:Wait() end
