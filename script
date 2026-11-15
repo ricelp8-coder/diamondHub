@@ -1,6 +1,7 @@
 local Releases = {
     [10762636904] = {Release = "Cameraman_TD", Folder = "CameraTD_Macros", RequiresCache = true},
     [2440500124] = {Release = "Doors", Folder = "DiamondHub_Doors", RequiresCache = false},
+    [4938220315] = {Release = "Skibid_TD", Folder = "SkibidTD", RequiresCache = true},
 }
 local BaseURL = "https://raw.githubusercontent.com/ricelp8-coder/koch/main/"
 if not game:IsLoaded() then game.Loaded:Wait() end
